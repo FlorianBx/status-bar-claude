@@ -27,7 +27,8 @@ fi
 
 build_bar() {
   local pct=$1
-  local filled=$(( pct * 8 / 100 ))
+  local filled=$(( (pct * 8 + 50) / 100 ))
+  [ "$filled" -gt 8 ] && filled=8
   local color
   if   [ "$pct" -ge 90 ]; then color="$BOLD_RED"
   elif [ "$pct" -ge 75 ]; then color="$RED"
