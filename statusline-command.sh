@@ -1,95 +1,305 @@
 #!/usr/bin/env bash
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 input=$(cat)
 
-cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd')
-model=$(echo "$input" | jq -r '.model.display_name')
-ctx_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-hour_pct=$(echo "$input" | jq -r '(.rate_limits["5h"] // .rate_limits.five_hour // .rate_limits.hour).used_percentage // empty')
-week_pct=$(echo "$input" | jq -r '(.rate_limits["7d"] // .rate_limits.seven_day // .rate_limits.week).used_percentage // empty')
-hour_reset=$(echo "$input" | jq -r '(.rate_limits["5h"] // .rate_limits.five_hour // .rate_limits.hour).resets_at // empty')
+IFS=$'\x1f' read -r cwd model ctx_pct ctx_size hour_pct week_pct hour_reset week_reset thinking effort duration_ms api_duration_ms <<EOF
+$(echo "$input" | jq -r '[
+  (.workspace.current_dir // .cwd // ""),
+  (.model.display_name // ""),
+  ((.context_window.used_percentage // "") | tostring),
+  ((.context_window.context_window_size // "") | tostring),
+  (((.rate_limits["5h"] // .rate_limits.five_hour // .rate_limits.hour // {}).used_percentage // "") | tostring),
+  (((.rate_limits["7d"] // .rate_limits.seven_day // .rate_limits.week // {}).used_percentage // "") | tostring),
+  (((.rate_limits["5h"] // .rate_limits.five_hour // .rate_limits.hour // {}).resets_at // "") | tostring),
+  (((.rate_limits["7d"] // .rate_limits.seven_day // .rate_limits.week // {}).resets_at // "") | tostring),
+  (.thinking.enabled | if . then "*" else "" end),
+  (.effort.level // ""),
+  ((.cost.total_duration_ms // "") | tostring),
+  ((.cost.total_api_duration_ms // "") | tostring)
+] | join("\u001f")')
+EOF
 
 dir=$(basename "$cwd")
+now=$(date +%s)
+[[ "$hour_reset" =~ ^[0-9]+$ ]] || hour_reset=""
+[[ "$week_reset" =~ ^[0-9]+$ ]] || week_reset=""
+thinking="${thinking:-}"; effort="${effort:-}"
+duration_ms="${duration_ms:-}"; api_duration_ms="${api_duration_ms:-}"
+[[ "$ctx_size" =~ ^[0-9]+$ ]] || ctx_size=""
 
-RESET=$'\033[0m'
-DIM=$'\033[2;37m'
-WHITE=$'\033[0;37m'
-BOLD_WHITE=$'\033[1;37m'
-GREEN=$'\033[0;32m'
-CYAN=$'\033[0;36m'
-YELLOW=$'\033[0;33m'
-RED=$'\033[0;31m'
-BOLD_RED=$'\033[1;31m'
+ESC=$'\033'
+RESET="${ESC}[0m"
+DIM="${ESC}[2;37m"
+WHITE="${ESC}[0;37m"
+BOLD_WHITE="${ESC}[1;37m"
+GREEN="${ESC}[0;32m"
+CYAN="${ESC}[0;36m"
+YELLOW="${ESC}[0;33m"
+RED="${ESC}[0;31m"
+BOLD_RED="${ESC}[1;31m"
+ALERT="${ESC}[1;31m"
 
-branch=""
-if git -C "$cwd" rev-parse --git-dir > /dev/null 2>&1; then
-  branch=$(git -C "$cwd" -c core.hooksPath=/dev/null symbolic-ref --short HEAD 2>/dev/null || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
-fi
+to_pct() {
+  local v
+  v=$(LC_ALL=C printf '%.0f' "$1" 2>/dev/null)
+  [ -z "$v" ] && v=${1%%.*}
+  [[ "$v" =~ ^-?[0-9]+$ ]] || v=0
+  [ "$v" -lt 0 ] && v=0
+  [ "$v" -gt 100 ] && v=100
+  printf '%s' "$v"
+}
 
-build_bar() {
-  local pct=$1
-  local filled=$(( pct * 8 / 100 ))
-  local color
-  if   [ "$pct" -ge 90 ]; then color="$BOLD_RED"
-  elif [ "$pct" -ge 75 ]; then color="$RED"
-  elif [ "$pct" -ge 50 ]; then color="$YELLOW"
-  else                          color="$CYAN"
+trunc() {
+  local s=$1 m=$2
+  if (( ${#s} > m )); then printf '%s…' "${s:0:m-1}"; else printf '%s' "$s"; fi
+}
+
+fmt_dur() {
+  local s=$1
+  if   (( s >= 86400 )); then printf '%dd%dh' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+  elif (( s >= 3600 ));  then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  elif (( s >= 60 ));    then printf '%dm' $(( s / 60 ))
+  else                        printf '<1m'
   fi
-  local i=1 result=""
-  while [ $i -le 8 ]; do
-    if [ $i -le $filled ]; then result="${result}${color}▊${RESET}"
-    else                        result="${result}${DIM}▊${RESET}"
-    fi
-    i=$(( i + 1 ))
-  done
-  printf '%s' "$result"
+}
+
+fmt_dur_ms() {
+  local s=$(( $1 / 1000 ))
+  if   (( s >= 86400 )); then printf '%dd%dh' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+  elif (( s >= 3600 ));  then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  elif (( s >= 60 ));    then printf '%dm' $(( s / 60 ))
+  else                        printf '<1m'
+  fi
+}
+
+fmt_tokens() {
+  local n=$1
+  if   (( n >= 1000000 )); then awk -v n="$n" 'BEGIN{printf "%.1fM", n/1000000}'
+  elif (( n >= 1000 ));    then printf '%dk' $(( n / 1000 ))
+  else                          printf '%d' "$n"
+  fi
 }
 
 format_reset_time() {
-  local epoch=$1
-  local hhmm
+  local epoch=$1 hhmm
   hhmm=$(date -r "$epoch" "+%l:%M %p" 2>/dev/null || date -d "@$epoch" "+%l:%M %p" 2>/dev/null)
   [ -z "$hhmm" ] && return 1
   hhmm="${hhmm# }"
-  local hour=${hhmm%%:*}
-  local rest=${hhmm#*:}
-  local mins=${rest%% *}
-  local ampm=${rest##* }
+  local hour=${hhmm%%:*} rest=${hhmm#*:}
+  local mins=${rest%% *} ampm=${rest##* }
   ampm=$(printf '%s' "$ampm" | tr '[:upper:]' '[:lower:]')
-  if [ "$mins" = "00" ]; then
-    printf '%s%s' "$hour" "$ampm"
-  else
-    printf '%s:%s%s' "$hour" "$mins" "$ampm"
+  if [ "$mins" = "00" ]; then printf '%s%s' "$hour" "$ampm"
+  else printf '%s:%s%s' "$hour" "$mins" "$ampm"
   fi
 }
 
-out="${BOLD_WHITE}${dir}${RESET}"
-[ -n "$branch" ] && out="${out}  ${GREEN}${branch}${RESET}"
-if [ -n "$model" ]; then
-  out="${out}  ${WHITE}${model}${RESET}"
-else
-  out="${out}  ${DIM}claude${RESET}"
-fi
-
-if [ -n "$ctx_pct" ]; then
-  pct=$(printf "%.0f" "$ctx_pct")
-  out="${out}  ${DIM}ctx${RESET} $(build_bar "$pct") ${WHITE}${pct}%${RESET}"
-fi
-
-if [ -n "$hour_pct" ]; then
-  pct=$(printf "%.0f" "$hour_pct")
-  out="${out}  ${DIM}5h${RESET} $(build_bar "$pct") ${WHITE}${pct}%${RESET}"
-fi
-
-if [ -n "$week_pct" ]; then
-  pct=$(printf "%.0f" "$week_pct")
-  out="${out}  ${DIM}7d${RESET} $(build_bar "$pct") ${WHITE}${pct}%${RESET}"
-fi
-
-if [ -n "$hour_reset" ]; then
-  reset_str=$(format_reset_time "$hour_reset")
-  if [ -n "$reset_str" ]; then
-    out="${out}  ${DIM}reset${RESET} ${WHITE}${reset_str}${RESET}"
+pct_color() {
+  if   (( $1 >= 90 )); then PC=$BOLD_RED
+  elif (( $1 >= 75 )); then PC=$RED
+  elif (( $1 >= 50 )); then PC=$YELLOW
+  else                      PC=$CYAN
   fi
+}
+
+cd_color() {
+  local p=$(( $1 * 100 / $2 ))
+  if   (( p >= 50 )); then CDC=$GREEN
+  elif (( p >= 25 )); then CDC=$CYAN
+  elif (( p >= 10 )); then CDC=$YELLOW
+  else                     CDC=$RED
+  fi
+}
+
+EIGHTH=("" ▏ ▎ ▍ ▌ ▋ ▊ ▉)
+
+build_bar() {
+  local pct=$1 w=$2 e8 full rem i
+  e8=$(( pct * w * 8 / 100 ))
+  full=$(( e8 / 8 )); rem=$(( e8 % 8 ))
+  (( pct > 0 && e8 == 0 )) && rem=1
+  BAR=""
+  for (( i = 0; i < w; i++ )); do
+    if (( i < full )); then
+      BAR+="${WHITE}█"
+    elif (( i == full && rem > 0 )); then
+      BAR+="${WHITE}${EIGHTH[$rem]}"
+    else
+      BAR+="${DIM}░${RESET}"
+    fi
+  done
+  BAR+=$RESET
+}
+
+meter() {
+  local label=$1 pct=$2 barstr=""
+  pct_color "$pct"
+  if (( BAR_W > 0 )); then build_bar "$pct" "$BAR_W"; barstr=" $BAR"; fi
+  if (( pct >= 90 )); then
+    METER="${DIM}${label}${RESET}${barstr} ${ALERT}⚠ ${pct}%${RESET}"
+  else
+    METER="${DIM}${label}${RESET}${barstr} ${PC}${pct}%${RESET}"
+  fi
+}
+
+ctx_i="";  [ -n "$ctx_pct" ]  && ctx_i=$(to_pct "$ctx_pct")
+hour_i=""; [ -n "$hour_pct" ] && hour_i=$(to_pct "$hour_pct")
+week_i=""; [ -n "$week_pct" ] && week_i=$(to_pct "$week_pct")
+
+# ── shared cache — all windows converge ──────────────────────────────
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-statusline"
+CACHE="$CACHE_DIR/cache"
+mkdir -p "$CACHE_DIR" 2>/dev/null
+
+if [ -f "$CACHE" ]; then
+  IFS=$'\x1f' read -r cache_ts cache_ctx cache_hour cache_week cache_hr cache_wr cache_model cache_thinking cache_effort cache_duration_ms cache_api_duration_ms cache_ctx_size < "$CACHE" 2>/dev/null || cache_ts=0
+else
+  cache_ts=0
 fi
 
-printf '%s' "$out"
+if (( now - cache_ts > 30 )) || [ -z "${cache_ctx:-}" ]; then
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+    "$now" "$ctx_i" "$hour_i" "$week_i" "$hour_reset" "$week_reset" \
+    "$model" "$thinking" "$effort" "$duration_ms" "$api_duration_ms" "$ctx_size" > "$CACHE.tmp"
+  mv "$CACHE.tmp" "$CACHE" 2>/dev/null || true
+  IFS=$'\x1f' read -r cache_ts cache_ctx cache_hour cache_week cache_hr cache_wr cache_model cache_thinking cache_effort cache_duration_ms cache_api_duration_ms cache_ctx_size < "$CACHE" 2>/dev/null || true
+fi
+
+if [ -n "${cache_ctx:-}" ]; then
+  ctx_i=$cache_ctx
+  hour_i=$cache_hour
+  week_i=$cache_week
+  [ -n "$cache_model" ] && model=$cache_model
+  [[ "$cache_hr" =~ ^[0-9]+$ ]] && hour_reset=$cache_hr
+  [[ "$cache_wr" =~ ^[0-9]+$ ]] && week_reset=$cache_wr
+  [ -n "$cache_thinking" ] && thinking=$cache_thinking
+  [ -n "$cache_effort" ] && effort=$cache_effort
+  [ -n "$cache_duration_ms" ] && duration_ms=$cache_duration_ms
+  [ -n "$cache_api_duration_ms" ] && api_duration_ms=$cache_api_duration_ms
+  [[ "$cache_ctx_size" =~ ^[0-9]+$ ]] && ctx_size=$cache_ctx_size
+fi
+
+# ── git ──────────────────────────────────────────────────────────────
+branch="" dirty="" ab=""
+[ -n "$cwd" ] && gs=$(git -C "$cwd" -c core.hooksPath=/dev/null status --porcelain=v2 --branch --untracked-files=no 2>/dev/null) && {
+  branch=$(sed -n 's/^# branch\.head //p' <<<"$gs")
+  [ "$branch" = "(detached)" ] && branch=$(git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
+  abline=$(sed -n 's/^# branch\.ab //p' <<<"$gs")
+  if [ -n "$abline" ]; then
+    a=${abline%% *}; b=${abline##* }; a=${a#+}; b=${b#-}
+    [ "$a" != 0 ] && ab+="↑$a"
+    [ "$b" != 0 ] && ab+="↓$b"
+  fi
+  grep -q '^[^#]' <<<"$gs" && dirty=1
+}
+
+# ── terminal width ───────────────────────────────────────────────────
+cols=${COLUMNS:-}
+if ! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -le 0 ]; then
+  cols=$( (stty size < /dev/tty) 2>/dev/null | awk '{print $2}')
+fi
+if ! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -le 0 ]; then
+  pid=$PPID
+  for _ in 1 2 3 4 5; do
+    [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] || break
+    t=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$t" ] && [ "$t" != "?" ] && [ -r "/dev/$t" ]; then
+      cols=$( (stty size < "/dev/$t") 2>/dev/null | awk '{print $2}')
+      [[ "$cols" =~ ^[0-9]+$ ]] && [ "$cols" -gt 0 ] && break
+    fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+fi
+! [[ "$cols" =~ ^[0-9]+$ ]] || [ "$cols" -le 0 ] && cols=80
+
+PAD=${CLAUDE_STATUSLINE_PAD:-4}
+vis_len() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g' | wc -m; }
+
+render() {
+  local lvl=$1 name_max sep
+  local BAR_W=0 show_5h=1 show_7d=1 show_branch=1 show_cd=1 show_abs=1 show_wcd=1 show_model=1 show_duration=1
+  case $lvl in
+    0)  BAR_W=8;  name_max=24; show_branch=1 show_5h=1 show_7d=1 show_cd=1 show_wcd=1 show_abs=1 show_model=1 show_duration=1 ;;
+    1)  BAR_W=6;  name_max=20; show_branch=1 show_5h=1 show_7d=1 show_cd=1 show_wcd=1 show_model=1 show_duration=1 ;;
+    2)  BAR_W=6;  name_max=18; show_branch=1 show_5h=1 show_7d=1 show_cd=1 show_wcd=1 show_duration=1 ;;
+    3)  BAR_W=4;  name_max=16; show_branch=1 show_5h=1 show_7d=1 show_cd=1 show_duration=1 ;;
+    4)  BAR_W=0;  name_max=14; show_branch=1 show_5h=1 show_7d=1 ;;
+    5)  BAR_W=0;  name_max=12; show_branch=1 show_5h=1 show_7d=1 ;;
+    6)  BAR_W=0;  name_max=12; show_branch=1 show_5h=1 ;;
+    7)  BAR_W=0;  name_max=10; show_branch=1 show_5h=1 ;;
+    8)  BAR_W=0;  name_max=10; show_5h=1 ;;
+    9)  BAR_W=0;  name_max=10 ;;
+    10) BAR_W=0;  name_max=10; show_model=0 ;;
+  esac
+  sep=" ${DIM}│${RESET} "
+
+  local d b
+  d=$(trunc "$dir" "$name_max")
+  b=$(trunc "$branch" "$name_max")
+
+  OUT="${BOLD_WHITE}${d}${RESET}"
+  if [ -n "$branch" ] && (( show_branch )); then
+    OUT+=" ${DIM}⎇${RESET} ${GREEN}${b}${RESET}"
+    [ -n "$dirty" ] && OUT+=" ${YELLOW}●${RESET}"
+    [ -n "$ab" ] && OUT+=" ${DIM}${ab}${RESET}"
+  fi
+  if (( show_model )); then
+    OUT+="${sep}${WHITE}${model:-claude}${RESET}"
+    [ -n "$thinking" ] && OUT+=" ${WHITE}${thinking}${RESET}"
+    [ -n "$effort" ] && OUT+=" ${DIM}${effort}${RESET}"
+  fi
+  if [ -n "$duration_ms" ] && (( show_duration )); then
+    local dur api_dur
+    dur=$(fmt_dur_ms "$duration_ms")
+    OUT+="${sep}${DIM}Tst${RESET} ${WHITE}${dur}${RESET}"
+    if [ -n "$api_duration_ms" ]; then
+      api_dur=$(fmt_dur_ms "$api_duration_ms")
+      OUT+=" ${DIM}api${RESET} ${WHITE}${api_dur}${RESET}"
+    fi
+  fi
+  if (( show_duration )); then
+    local now_str
+    now_str=$(format_reset_time "$now")
+    [ -n "$now_str" ] && OUT+="${sep}${DIM}🕐${RESET} ${WHITE}${now_str}${RESET}"
+  fi
+  if [ -n "$ctx_i" ]; then
+    meter ctx "$ctx_i"
+    if [ -n "$ctx_size" ] && (( ctx_size > 0 )); then
+      local consumed
+      consumed=$(( ctx_i * ctx_size / 100 ))
+      METER+=" ${CYAN}$(fmt_tokens "$consumed")/$(fmt_tokens "$ctx_size")${RESET}"
+    fi
+    OUT+="${sep}${METER}"
+  fi
+  if [ -n "$hour_i" ] && (( show_5h )); then
+    meter 5h "$hour_i"
+    OUT+="${sep}${METER}"
+    if [ -n "$hour_reset" ] && (( show_cd )) && (( hour_reset > now )); then
+      cd_color $(( hour_reset - now )) 18000
+      OUT+=" ${DIM}↻${RESET} ${CDC}$(fmt_dur $(( hour_reset - now )))${RESET}"
+      if (( show_abs )); then
+        abs=$(format_reset_time "$hour_reset") && [ -n "$abs" ] && OUT+=" ${DIM}(${abs})${RESET}"
+      fi
+    fi
+  fi
+  if [ -n "$week_i" ] && (( show_7d )); then
+    meter 7d "$week_i"
+    OUT+="${sep}${METER}"
+    if [ -n "$week_reset" ] && (( show_wcd )) && (( week_reset > now )); then
+      cd_color $(( week_reset - now )) 604800
+      OUT+=" ${DIM}↻${RESET} ${CDC}$(fmt_dur $(( week_reset - now )))${RESET}"
+    fi
+  fi
+}
+
+for lvl in 0 1 2 3 4 5 6 7 8 9 10; do
+  render "$lvl"
+  (( $(vis_len "$OUT") <= cols - PAD )) && break
+done
+
+if (( $(vis_len "$OUT") > cols - PAD )); then
+  max=$(( cols - PAD ))
+  (( max < 1 )) && max=1
+  OUT="${BOLD_WHITE}$(trunc "$dir" "$max")${RESET}"
+fi
+
+printf '%s' "$OUT"
